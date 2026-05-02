@@ -7,6 +7,9 @@ from flask_cors import CORS
 import os
 from dotenv import load_dotenv
 import requests
+import json
+import re
+import google.generativeai as genai
 
 load_dotenv()
 
@@ -15,6 +18,10 @@ CORS(app)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:TP007@localhost:5432/groundwater_db")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
@@ -111,28 +118,44 @@ def kpi():
         where_clause, params = build_filters(request.args)
         query = f"""
             SELECT 
-                AVG(dtwl) as overall_dtwl,
-                MAX(dtwl) as current_dtwl
+                AVG(dtwl) AS overall_dtwl,
+                (SELECT dtwl FROM groundwater_data {where_clause} ORDER BY date DESC LIMIT 1) AS current_dtwl,
+                (SELECT date FROM groundwater_data {where_clause} ORDER BY date DESC LIMIT 1) AS current_date,
+                AVG(dtwl) FILTER (WHERE season ILIKE 'Premonsoon') AS premonsoon,
+                AVG(dtwl) FILTER (WHERE season ILIKE 'Postmonsoon') AS postmonsoon
             FROM groundwater_data
             {where_clause}
         """
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(query, params)
+                cur.execute(query, params + params + params)
                 result = cur.fetchone()
             
-        overall_dtwl = round(result[0], 2) if result and result[0] is not None else 0
-        current_dtwl = round(result[1], 2) if result and result[1] is not None else 0
+        overall_dtwl = round(result[0], 2) if result and result[0] is not None else "--"
+        current_dtwl = round(result[1], 2) if result and result[1] is not None else "--"
+        current_date_val = result[2] if result and result[2] is not None else None
+        
+        if current_date_val:
+            try:
+                current_date = current_date_val.strftime('%Y-%m-%d')
+            except Exception:
+                current_date = str(current_date_val)[:10]
+        else:
+            current_date = "--"
+
+        premonsoon = round(result[3], 2) if result and result[3] is not None else "--"
+        postmonsoon = round(result[4], 2) if result and result[4] is not None else "--"
         
         return jsonify({
             "overall_dtwl": overall_dtwl,
             "current_dtwl": current_dtwl,
-            "premonsoon": overall_dtwl,
-            "postmonsoon": overall_dtwl
+            "current_date": current_date,
+            "premonsoon": premonsoon,
+            "postmonsoon": postmonsoon
         })
     except Exception as e:
         print("Error /kpi:", e)
-        return jsonify({"overall_dtwl": 0, "current_dtwl": 0, "premonsoon": 0, "postmonsoon": 0})
+        return jsonify({"overall_dtwl": "--", "current_dtwl": "--", "current_date": "--", "premonsoon": "--", "postmonsoon": "--"})
 
 @app.route('/trend-data')
 def trend_data():
@@ -273,38 +296,90 @@ def weather():
         print("Error /weather:", e)
         return jsonify({"temperature": 25.0, "humidity": 60})
 
+def get_ai_crop_recommendations(state, district, block, village, dtwl, avg_dtwl, temperature, humidity, rainfall):
+    prompt = f"""
+You are an agricultural expert.
+
+Based on the following data, recommend crops.
+
+Location: {state}, {district}, {block}, {village}
+DTWL: {dtwl} meters
+Average DTWL: {avg_dtwl} meters
+Temperature: {temperature} °C
+Humidity: {humidity} %
+Rainfall: {rainfall} mm
+
+STRICT RULES:
+- Return ONLY valid JSON
+- Do NOT include explanations outside JSON
+- Follow EXACT structure below:
+
+{{
+  "suitable": [
+    {{"crop": "Crop Name", "reason": "Short reason"}}
+  ],
+  "moderate": [
+    {{"crop": "Crop Name", "reason": "Short reason"}}
+  ],
+  "not_recommended": [
+    {{"crop": "Crop Name", "reason": "Short reason"}}
+  ]
+}}
+
+- If no crops, return empty arrays []
+"""
+    try:
+        model = genai.GenerativeModel("gemini-2.5-flash")
+        response = model.generate_content(prompt)
+        raw_text = response.text.strip()
+
+        match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+            except:
+                parsed = {"suitable": [], "moderate": [], "not_recommended": []}
+        else:
+            parsed = {"suitable": [], "moderate": [], "not_recommended": []}
+
+        if not parsed.get("suitable") and not parsed.get("moderate") and not parsed.get("not_recommended"):
+            parsed = {
+                "suitable": [{"crop": "Millets", "reason": "Low water requirement"}],
+                "moderate": [{"crop": "Pulses", "reason": "Moderate water requirement"}],
+                "not_recommended": [{"crop": "Rice", "reason": "High water requirement"}]
+            }
+        return parsed
+    except Exception as e:
+        print("Error getting AI crop recommendations:", e)
+        return {
+            "suitable": [{"crop": "Millets", "reason": "Low water requirement"}],
+            "moderate": [{"crop": "Pulses", "reason": "Moderate water requirement"}],
+            "not_recommended": [{"crop": "Rice", "reason": "High water requirement"}]
+        }
+
 @app.route('/ai-crop')
 def ai_crop():
     try:
-        temp = float(request.args.get('temp', 0))
-        rainfall = float(request.args.get('rainfall', 0))
-        dtwl = float(request.args.get('dtwl', 0))
+        state = request.args.get("state", "")
+        district = request.args.get("district", "")
+        block = request.args.get("block", "")
+        village = request.args.get("village", "")
 
-        crops = []
+        dtwl = request.args.get('dtwl', '0')
+        avg_dtwl = request.args.get('avg_dtwl', '0')
+        temperature = request.args.get('temp', '0')
+        humidity = request.args.get('humidity', '0')
+        rainfall = request.args.get('rainfall', '0')
 
-        if rainfall > 800:
-            crops.append("Rice")
-        if temp > 30:
-            crops.append("Millet")
-        if dtwl < 5:
-            crops.append("Sugarcane")
-        if 5 <= dtwl <= 10:
-            crops.append("Groundnut")
-        if rainfall < 300:
-            crops.append("Cotton")
-
-        if not crops:
-            crops = ["Pulses", "Vegetables"]
-
-        return jsonify({
-            "crops": crops,
-            "reason": "AI-based recommendation using environmental conditions"
-        })
+        parsed = get_ai_crop_recommendations(state, district, block, village, dtwl, avg_dtwl, temperature, humidity, rainfall)
+        return jsonify(parsed)
 
     except Exception as e:
+        print("Error /ai-crop:", e)
         return jsonify({
-            "crops": ["Fallback Crop"],
-            "reason": str(e)
+            "suitable": [{"crop": "Millets", "reason": "Low water requirement"}],
+            "moderate": [{"crop": "Pulses", "reason": "Moderate water requirement"}],
+            "not_recommended": [{"crop": "Rice", "reason": "High water requirement"}]
         })
 
 @app.route('/api/recharge-efficiency')
@@ -347,22 +422,29 @@ def recharge_efficiency():
 def autonomy():
     try:
         where_clause, params = build_filters(request.args)
-        query = f"SELECT MAX(dtwl) as current FROM groundwater_data {where_clause}"
+        query = f"SELECT dtwl as current FROM groundwater_data {where_clause} ORDER BY date DESC LIMIT 1"
         with get_db_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 cur.execute(query, params)
                 row = cur.fetchone()
 
-        current = row['current'] if row and row['current'] else 0
-        days = current / 0.05 if current else 0
+        current = row['current'] if row and row['current'] is not None else None
+        
+        if current is None:
+            return jsonify({"days_of_autonomy": "--", "status": "Unknown"})
+        
+        if current == 0:
+            days = 0
+        else:
+            days = round(current / 0.05)
         
         status = "Safe"
         if days < 100: status = "Warning"
         elif days < 365: status = "Moderate"
 
-        return jsonify({"days": round(days), "status": status})
+        return jsonify({"days_of_autonomy": days, "status": status})
     except Exception:
-        return jsonify({"days": 0, "status": "Unknown"})
+        return jsonify({"days_of_autonomy": "--", "status": "Unknown"})
 
 @app.route('/api/borewell-safety')
 def borewell_safety():
@@ -588,6 +670,9 @@ def report():
         village = request.args.get('village', 'N/A')
         temp = request.args.get('temp', '--')
         humidity = request.args.get('humidity', '--')
+        rainfall = request.args.get('rainfall', '--')
+        req_dtwl = request.args.get('dtwl', '--')
+        req_avg_dtwl = request.args.get('avg_dtwl', '--')
 
         where_clause, params = build_filters(request.args)
         
@@ -669,6 +754,22 @@ def report():
         except Exception:
             alerts_html = "<li>Unable to load detailed alerts.</li>"
 
+        ai_crops = get_ai_crop_recommendations(state, district, block, village, req_dtwl, req_avg_dtwl, temp, humidity, rainfall)
+        
+        def build_crop_list(crops):
+            if not crops:
+                return "<li><em>No crops available for this category</em></li>"
+            return "".join([f"<li><strong>{c.get('crop', 'Unknown')}</strong> &rarr; {c.get('reason', '')}</li>" for c in crops])
+            
+        ai_crops_html = f"""
+            <h3>Suitable Crops</h3>
+            <ul>{build_crop_list(ai_crops.get('suitable', []))}</ul>
+            <h3>Moderate Crops</h3>
+            <ul>{build_crop_list(ai_crops.get('moderate', []))}</ul>
+            <h3>Not Recommended Crops</h3>
+            <ul>{build_crop_list(ai_crops.get('not_recommended', []))}</ul>
+        """
+
         html = f"""
         <html>
         <head>
@@ -704,6 +805,7 @@ def report():
                     <li><strong>Postmonsoon Average:</strong> {post} m</li>
                     <li><strong>Temperature:</strong> {temp}°C</li>
                     <li><strong>Humidity:</strong> {humidity}%</li>
+                    <li><strong>Rainfall:</strong> {rainfall} mm</li>
                 </ul>
             </div>
 
@@ -732,6 +834,11 @@ def report():
             <div class="section">
                 <h2>6. Insights Summary</h2>
                 <p>{insights_text}</p>
+            </div>
+            
+            <div class="section">
+                <h2>7. AI Crop Recommendation</h2>
+                {ai_crops_html}
             </div>
             
             <script>window.print();</script>
